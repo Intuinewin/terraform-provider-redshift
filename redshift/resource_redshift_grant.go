@@ -216,6 +216,32 @@ func resourceRedshiftGrantRead(db *DBConnection, d *schema.ResourceData) error {
 
 func resourceRedshiftGrantReadImpl(db *DBConnection, d *schema.ResourceData) error {
 	objectType := d.Get(grantObjectTypeAttr).(string)
+	databaseName := getDatabaseName(db, d)
+
+	// Datashares only support database level privileges, so we can skip reading grants for other object types for datashares
+	// Even if the database is created with the WITH_PRIVILEGES option, the privileges are not stored in the system tables and cannot be read back
+	datashare, err := isDatashare(db, databaseName)
+	if err != nil {
+		return err
+	}
+	if datashare && objectType != "database" {
+		log.Printf("[DEBUG] Read disabled for datashare '%s' and object type '%s'", databaseName, objectType)
+		return nil
+	}
+
+	// External schemas do not support table, function and procedure privileges, so we can skip reading grants for these object types for external schemas
+	if schemaName, ok := d.GetOk(grantSchemaAttr); ok {
+		schemaName := schemaName.(string)
+		externalSchema, err := isExternalSchema(db, schemaName)
+		if err != nil {
+			return err
+		}
+
+		if externalSchema && (objectType == "table" || objectType == "function" || objectType == "procedure") {
+			log.Printf("[DEBUG] Read disabled for external schema '%s' and object type '%s'", schemaName, objectType)
+			return nil
+		}
+	}
 
 	// todo: For roles, we currently don't read back from system tables
 	// The GRANT was executed successfully, so we trust the state
@@ -910,4 +936,43 @@ func generateGrantID(d *schema.ResourceData) string {
 	}
 
 	return strings.Join(parts, "_")
+}
+
+func isDatashare(db *DBConnection, databaseName string) (bool, error) {
+	query := fmt.Sprintf(
+		"SELECT * FROM SVV_DATASHARES WHERE share_type = %s AND consumer_database = %s LIMIT 1",
+		pq.QuoteLiteral("INBOUND"),
+		pq.QuoteLiteral(databaseName),
+	)
+
+	rows, err := db.Query(query)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		return true, nil
+	}
+
+	return false, nil
+}
+
+func isExternalSchema(db *DBConnection, schemaName string) (bool, error) {
+	query := fmt.Sprintf(
+		"SELECT * FROM SVV_EXTERNAL_SCHEMAS WHERE schemaname = %s LIMIT 1",
+		pq.QuoteLiteral(schemaName),
+	)
+
+	rows, err := db.Query(query)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		return true, nil
+	}
+
+	return false, nil
 }
